@@ -1,0 +1,488 @@
+-- Steal The Moon: automation
+-- Pit Goto loop: power hits 0 -> eat at pit -> full -> ropes -> rope gone -> next rope -> repeat
+-- + Banana Drop Grab + Auto Rope
+-- Manual stop: getgenv().PitGoto.stop() / .BananaDropGrab.stop() / .AutoRope.stop()
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local RS = game:GetService("ReplicatedStorage")
+local VIM = game:GetService("VirtualInputManager")
+
+local lp = Players.LocalPlayer
+local env = (getgenv and getgenv()) or _G
+
+local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
+
+-- ============================================================
+-- HELPERS
+-- ============================================================
+local function root()
+    local c = lp.Character
+    return c and c:FindFirstChild("HumanoidRootPart")
+end
+
+local function pressE()
+    pcall(function()
+        VIM:SendKeyEvent(true, Enum.KeyCode.E, false, game)
+        task.wait(0.02)
+        VIM:SendKeyEvent(false, Enum.KeyCode.E, false, game)
+    end)
+end
+
+local function teleportTo(pos)
+    local r = root()
+    if not r then return end
+    r.CFrame = CFrame.new(pos)
+    r.AssemblyLinearVelocity = Vector3.zero
+end
+
+-- Drop the character onto the ground at a given XZ position (0 studs high)
+local function teleportToFloor(xzPos)
+    local r = root()
+    if not r then return end
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = { lp.Character }
+    local origin = Vector3.new(xzPos.X, xzPos.Y + 50, xzPos.Z)
+    local result = workspace:Raycast(origin, Vector3.new(0, -300, 0), params)
+    local y = result and result.Position.Y or xzPos.Y
+    r.CFrame = CFrame.new(Vector3.new(xzPos.X, y, xzPos.Z))
+    r.AssemblyLinearVelocity = Vector3.zero
+end
+
+-- ============================================================
+-- POWER READ  (attributes first, HUD fallback)
+-- ============================================================
+local function readPower()
+    local now = lp:GetAttribute("PowerNow")
+    local max = lp:GetAttribute("PowerMax")
+    if type(now) == "number" and type(max) == "number" and max > 0 then
+        return now / max
+    end
+
+    local p = lp:GetAttribute("Power")
+    if type(p) == "number" then
+        if type(max) == "number" and max > 0 then
+            return p / max
+        end
+        return p > 1 and p / 100 or p
+    end
+
+    local gui = lp:FindFirstChild("PlayerGui")
+    local hud = gui and gui:FindFirstChild("Hud")
+    if hud then
+        local pc = hud:FindFirstChild("PC")
+        local holder = pc and pc:FindFirstChild("PowerHolder")
+        local fill = holder and holder:FindFirstChild("Power")
+        if fill then
+            local us = fill:FindFirstChildOfClass("UIScale")
+            if us then return us.Scale end
+            local ratio = math.max(fill.Size.X.Scale, fill.Size.Y.Scale)
+            if ratio > 0 then return ratio end
+        end
+
+        local stats = hud:FindFirstChild("Stats")
+        local sp = stats and stats:FindFirstChild("Power")
+        local v = sp and sp:FindFirstChild("Value")
+        if v and v:IsA("TextLabel") then
+            local a, b = v.Text:match("(%d+%.?%d*)%s*/%s*(%d+%.?%d*)")
+            if a and b then return tonumber(a) / tonumber(b) end
+            local pct = v.Text:match("(%d+%.?%d*)%%")
+            if pct then return tonumber(pct) / 100 end
+        end
+    end
+
+    return nil
+end
+
+-- ============================================================
+-- ROPES
+-- ============================================================
+local function listRopes()
+    local folder = workspace:FindFirstChild("Ropes")
+    if not folder then return {} end
+    local out = {}
+    for _, d in folder:GetChildren() do
+        if d:IsA("Model") or d:IsA("BasePart") then
+            table.insert(out, d)
+        end
+    end
+    return out
+end
+
+local function nearestRope(skip)
+    local r = root()
+    if not r then return nil end
+    local myPos = r.Position
+    local best, bestDist = nil, math.huge
+    for _, rope in listRopes() do
+        if rope ~= skip and rope.Parent then
+            local ok, pivot = pcall(function() return rope:GetPivot() end)
+            if ok and pivot then
+                local dist = (pivot.Position - myPos).Magnitude
+                if dist < bestDist then
+                    best, bestDist = rope, dist
+                end
+            end
+        end
+    end
+    return best
+end
+
+-- ============================================================
+-- 1) PIT GOTO  (continuous loop)
+-- ============================================================
+local PG = { active = false, conn = nil }
+local pgState = {
+    phase = "ropes",
+    startedAt = 0,
+    lastPress = 0,
+    barCheckAt = 0,
+    lastBar = nil,
+    fullSince = nil,
+    currentRope = nil,
+    ropeCheckAt = 0,
+}
+
+local PG_CONFIG = {
+    centerHover = Vector3.new(0, 3, 0),
+    pressInterval = 0.08,
+    barPollEvery = 0.25,
+    fullConfirmTime = 0.7,
+    fullThreshold = 0.97,
+    emptyThreshold = 0.02,
+    ropeRefreshEvery = 0.5,
+}
+
+local function goToEat()
+    pgState.phase = "travel"
+    pgState.lastBar = nil
+    pgState.fullSince = nil
+end
+
+local function goToRopes()
+    pgState.phase = "ropes"
+    pgState.currentRope = nil
+    pgState.ropeCheckAt = 0
+end
+
+local function pgStep()
+    if PG.active == false then return end
+    local r = root()
+    if not r then return end
+    local now = os.clock()
+
+    if pgState.phase == "ropes" then
+        local v = readPower()
+        if v ~= nil and v <= PG_CONFIG.emptyThreshold then
+            return goToEat()
+        end
+
+        if now - pgState.ropeCheckAt >= PG_CONFIG.ropeRefreshEvery then
+            pgState.ropeCheckAt = now
+            if not pgState.currentRope or not pgState.currentRope.Parent then
+                pgState.currentRope = nearestRope(nil)
+            end
+        end
+        local rope = pgState.currentRope
+        if rope and rope.Parent then
+            local ok, pivot = pcall(function() return rope:GetPivot() end)
+            if ok and pivot then
+                teleportToFloor(pivot.Position)
+            end
+        end
+        return
+    end
+
+    if pgState.phase == "travel" then
+        local pit = workspace:FindFirstChild("BananaPit")
+        if not pit then return end
+        teleportTo(pit:GetPivot().Position + PG_CONFIG.centerHover)
+        pgState.phase = "eat"
+        pgState.barCheckAt = now
+        pgState.lastPress = 0
+        pgState.lastBar = nil
+        pgState.fullSince = nil
+        return
+    end
+
+    if pgState.phase == "eat" then
+        if now - pgState.lastPress >= PG_CONFIG.pressInterval then
+            pgState.lastPress = now
+            pressE()
+        end
+
+        if now - pgState.barCheckAt >= PG_CONFIG.barPollEvery then
+            pgState.barCheckAt = now
+            local v = readPower()
+            if v ~= nil then
+                local full = false
+                if v >= PG_CONFIG.fullThreshold then
+                    full = true
+                elseif pgState.lastBar ~= nil and v == pgState.lastBar then
+                    pgState.fullSince = pgState.fullSince or now
+                    if now - pgState.fullSince >= PG_CONFIG.fullConfirmTime then
+                        full = true
+                    end
+                else
+                    pgState.fullSince = nil
+                end
+                if full then return goToRopes() end
+                pgState.lastBar = v
+            end
+        end
+        return
+    end
+end
+
+local function pgStart()
+    if PG.active then return end
+    PG.active = true
+    pgState.phase = "ropes"
+    pgState.startedAt = os.clock()
+    pgState.lastPress = 0
+    pgState.barCheckAt = 0
+    pgState.lastBar = nil
+    pgState.fullSince = nil
+    pgState.currentRope = nil
+    pgState.ropeCheckAt = 0
+    PG.conn = RunService.Heartbeat:Connect(pgStep)
+end
+
+local function pgStop()
+    PG.active = false
+    pgState.phase = "ropes"
+    if PG.conn then PG.conn:Disconnect() PG.conn = nil end
+end
+
+env.PitGoto = { state = pgState, start = pgStart, stop = pgStop }
+
+-- ============================================================
+-- 2) BANANA DROP GRAB  (fast)
+-- ============================================================
+local BDG = { active = false, conn = nil }
+local bdgState = {
+    pending = {}, seen = {}, collected = 0, phase = "grab",
+    dwellUntil = 0, scanAt = 0, idleSince = nil, startedAt = 0, home = nil, done = false,
+}
+
+local BDG_CONFIG = {
+    hover = Vector3.new(0, 2.5, 0),
+    landWait = 0.35,
+    dwell = 0.15,
+    scanEvery = 0.2,
+    idleFinish = 2.5,
+    maxSeconds = 120,
+}
+
+local function bdgScan()
+    for _, d in workspace:GetDescendants() do
+        if d.Name == "BananaDrop" and d:IsA("Model") and not bdgState.seen[d] then
+            bdgState.seen[d] = true
+            table.insert(bdgState.pending, { model = d, readyAt = os.clock() + BDG_CONFIG.landWait })
+        end
+    end
+end
+
+local function bdgFinish()
+    bdgState.done = true
+    if BDG.conn then BDG.conn:Disconnect() BDG.conn = nil end
+end
+
+local function bdgStep()
+    if bdgState.done then return end
+    local r = root()
+    if not r then return end
+    local now = os.clock()
+
+    if now - bdgState.startedAt > BDG_CONFIG.maxSeconds then
+        bdgState.phase = "home"
+    end
+
+    if bdgState.phase == "home" then
+        if bdgState.home then
+            r.CFrame = bdgState.home
+            r.AssemblyLinearVelocity = Vector3.zero
+        end
+        return bdgFinish()
+    end
+
+    if now - bdgState.scanAt >= BDG_CONFIG.scanEvery then
+        bdgState.scanAt = now
+        bdgScan()
+    end
+
+    local live = {}
+    for _, e in bdgState.pending do
+        if e.model.Parent then table.insert(live, e) end
+    end
+    bdgState.pending = live
+
+    if #bdgState.pending == 0 then
+        bdgState.idleSince = bdgState.idleSince or now
+        if now - bdgState.idleSince >= BDG_CONFIG.idleFinish then
+            bdgState.phase = "home"
+        end
+        return
+    end
+    bdgState.idleSince = nil
+
+    if now < bdgState.dwellUntil then return end
+
+    local target, idx = nil, nil
+    for i, e in bdgState.pending do
+        if now >= e.readyAt then target, idx = e, i break end
+    end
+    if not target then return end
+
+    table.remove(bdgState.pending, idx)
+    r.CFrame = CFrame.new(target.model:GetPivot().Position + BDG_CONFIG.hover)
+    r.AssemblyLinearVelocity = Vector3.zero
+    bdgState.collected += 1
+    bdgState.dwellUntil = now + BDG_CONFIG.dwell
+end
+
+local function bdgStart()
+    if BDG.active then return end
+    BDG.active = true
+    bdgState.pending = {}
+    bdgState.seen = {}
+    bdgState.collected = 0
+    bdgState.phase = "grab"
+    bdgState.dwellUntil = 0
+    bdgState.scanAt = 0
+    bdgState.idleSince = nil
+    bdgState.startedAt = os.clock()
+    bdgState.home = (root() and root().CFrame) or nil
+    bdgState.done = false
+    bdgScan()
+    BDG.conn = RunService.Heartbeat:Connect(bdgStep)
+end
+
+local function bdgStop()
+    BDG.active = false
+    bdgState.done = true
+    if BDG.conn then BDG.conn:Disconnect() BDG.conn = nil end
+end
+
+env.BananaDropGrab = { state = bdgState, start = bdgStart, stop = bdgStop }
+
+-- ============================================================
+-- 3) AUTO ROPE  (on floor)
+-- ============================================================
+local AR = { active = false, conn = nil }
+local arState = { fired = 0, lastFire = 0 }
+
+local Knit = require(RS.Packages.Knit)
+local Config = require(RS.Shared.Config)
+local Grip = require(RS.Shared.Grip)
+
+local function getPull()
+    local ok, ctrl = pcall(function()
+        return Knit.GetController("PullController")
+    end)
+    return ok and ctrl or nil
+end
+
+local function arStep()
+    if not AR.active then return end
+    if lp:GetAttribute("Rope") == nil then return end
+
+    local ok, mode = pcall(Config.pullGame, lp)
+    if not ok or mode ~= "grip" then return end
+
+    local round = Grip.decode(lp:GetAttribute("Grip"))
+    if not round then return end
+
+    local ctrl = getPull()
+    if not ctrl then return end
+
+    local now = os.clock()
+    if now - arState.lastFire < 0.02 then return end
+
+    local serverTime = workspace:GetServerTimeNow()
+    local marker = Grip.markerAt(round, serverTime)
+
+    local okHeave, result = pcall(function()
+        return ctrl:GripHeave(serverTime, marker, "perfect")
+    end)
+    if okHeave and result then
+        arState.fired += 1
+        arState.lastFire = now
+    end
+end
+
+local function arStart()
+    if AR.active then return end
+    AR.active = true
+    AR.conn = RunService.Heartbeat:Connect(arStep)
+end
+
+local function arStop()
+    AR.active = false
+    if AR.conn then AR.conn:Disconnect() AR.conn = nil end
+end
+
+env.AutoRope = { state = arState, start = arStart, stop = arStop }
+
+-- ============================================================
+-- 4) GO TO ROPES (one-shot, on floor)
+-- ============================================================
+local function goToRopesOnce()
+    local rope = nearestRope(nil)
+    if rope then
+        local ok, pivot = pcall(function() return rope:GetPivot() end)
+        if ok and pivot then
+            teleportToFloor(pivot.Position)
+        end
+    end
+end
+
+-- ============================================================
+-- RAYFIELD UI
+-- ============================================================
+local Window = Rayfield:CreateWindow({
+    Name = "Steal The Moon",
+    LoadingTitle = "Steal The Moon",
+    LoadingSubtitle = "Made by The Secret Lair",
+    ConfigurationSaving = { Enabled = true, FolderName = "StealTheMoon", FileName = "config" },
+})
+
+local BananaTab = Window:CreateTab("Bananas", 4483362458)
+
+BananaTab:CreateToggle({
+    Name = "Pit Goto Loop (eat <-> ropes)",
+    CurrentValue = false,
+    Flag = "PitGoto",
+    Callback = function(v) if v then pgStart() else pgStop() end end,
+})
+
+BananaTab:CreateToggle({
+    Name = "Banana Drop Grab",
+    CurrentValue = false,
+    Flag = "BananaDropGrab",
+    Callback = function(v) if v then bdgStart() else bdgStop() end end,
+})
+
+local RopeTab = Window:CreateTab("Rope", 4483362458)
+
+RopeTab:CreateToggle({
+    Name = "Auto Rope (perfect grip)",
+    CurrentValue = false,
+    Flag = "AutoRope",
+    Callback = function(v) if v then arStart() else arStop() end end,
+})
+
+RopeTab:CreateButton({
+    Name = "Go To Ropes",
+    Callback = function() goToRopesOnce() end,
+})
+
+local MiscTab = Window:CreateTab("Misc", 4483362458)
+
+MiscTab:CreateButton({
+    Name = "Stop All",
+    Callback = function() pgStop() bdgStop() arStop() end,
+})
+
+return env
